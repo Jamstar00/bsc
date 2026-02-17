@@ -106,6 +106,14 @@ func (mip *mockInvalidPOSA) IsActiveValidatorAt(chain consensus.ChainHeaderReade
 	return true
 }
 
+func (mp *mockPOSA) CheckFinalityAndNotify(chain consensus.ChainHeaderReader, targetBlockHash common.Hash, notifyFn func(finalizedHeader *types.Header)) {
+	// No-op for testing
+}
+
+func (mip *mockInvalidPOSA) CheckFinalityAndNotify(chain consensus.ChainHeaderReader, targetBlockHash common.Hash, notifyFn func(finalizedHeader *types.Header)) {
+	// No-op for testing
+}
+
 func (pool *VotePool) verifyStructureSizeOfVotePool(receivedVotes, curVotes, futureVotes, curVotesPq, futureVotesPq int) bool {
 	for i := 0; i < timeThreshold; i++ {
 		time.Sleep(1 * time.Second)
@@ -284,7 +292,7 @@ func testVotePool(t *testing.T, isValidRules bool) {
 	// Test future votes scenario: votes number within latestBlockHeader ~ latestBlockHeader + 11
 	futureVote := &types.VoteEnvelope{
 		Data: &types.VoteData{
-			TargetNumber: 294,
+			TargetNumber: 314,
 		},
 	}
 	if err := voteManager.signer.SignVote(futureVote); err != nil {
@@ -304,7 +312,7 @@ func testVotePool(t *testing.T, isValidRules bool) {
 	// Test duplicate vote case, shouldn'd be put into vote pool
 	duplicateVote := &types.VoteEnvelope{
 		Data: &types.VoteData{
-			TargetNumber: 294,
+			TargetNumber: 314,
 		},
 	}
 	if err := voteManager.signer.SignVote(duplicateVote); err != nil {
@@ -333,14 +341,14 @@ func testVotePool(t *testing.T, isValidRules bool) {
 		t.Fatalf("put vote failed")
 	}
 
-	// Test transfer votes from future to cur, latest block header is #308 after the following generation
-	// For the above BlockNumber 279, it did not have blockHash, should be assigned as well below.
-	curNumber := 288
+	// Test transfer votes from future to cur, latest block header is #328 after the following generation
+	// For the above BlockNumber 314, it did not have blockHash, should be assigned as well below.
+	curNumber := 308
 	var futureBlockHash common.Hash
 	for i := 0; i < 20; i++ {
 		bs, _ = core.GenerateChain(params.TestChainConfig, bs[len(bs)-1], ethash.NewFaker(), db, 1, nil)
 		curNumber += 1
-		if curNumber == 294 {
+		if curNumber == 314 {
 			futureBlockHash = bs[0].Hash()
 			futureVotesMap := votePool.futureVotes
 			voteBox := futureVotesMap[common.Hash{}]

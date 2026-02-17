@@ -221,11 +221,11 @@ func (indexer *txIndexer) resolveHead() uint64 {
 	if headBlockHash == (common.Hash{}) {
 		return 0
 	}
-	headBlockNumber := rawdb.ReadHeaderNumber(indexer.db, headBlockHash)
-	if headBlockNumber == nil {
+	headBlockNumber, ok := rawdb.ReadHeaderNumber(indexer.db, headBlockHash)
+	if !ok {
 		return 0
 	}
-	return *headBlockNumber
+	return headBlockNumber
 }
 
 // loop is the scheduler of the indexer, assigning indexing/unindexing tasks depending
@@ -235,8 +235,8 @@ func (indexer *txIndexer) loop(chain *BlockChain) {
 
 	// Listening to chain events and manipulate the transaction indexes.
 	var (
-		stop   chan struct{} // Non-nil if background routine is active
-		done   chan struct{} // Non-nil if background routine is active
+		stop   chan struct{} // Non-nil if background routine is active.
+		done   chan struct{} // Non-nil if background routine is active.
 		headCh = make(chan ChainHeadEvent)
 		sub    = chain.SubscribeChainHeadEvent(headCh)
 	)

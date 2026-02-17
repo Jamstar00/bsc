@@ -49,12 +49,12 @@ type resettableFreezer struct {
 //
 // The reset function will delete directory atomically and re-create the
 // freezer from scratch.
-func newResettableFreezer(datadir string, namespace string, readonly bool, maxTableSize uint32, tables map[string]freezerTableConfig) (*resettableFreezer, error) {
+func newResettableFreezer(datadir string, namespace string, readonly bool, maxTableSize uint32, tables map[string]freezerTableConfig, isIncr bool) (*resettableFreezer, error) {
 	if err := cleanup(datadir); err != nil {
 		return nil, err
 	}
 	opener := func() (*Freezer, error) {
-		return NewFreezer(datadir, namespace, readonly, maxTableSize, tables)
+		return NewFreezer(datadir, namespace, readonly, maxTableSize, tables, isIncr)
 	}
 	freezer, err := opener()
 	if err != nil {
@@ -124,6 +124,15 @@ func (f *resettableFreezer) AncientRange(kind string, start, count, maxBytes uin
 	defer f.lock.RUnlock()
 
 	return f.freezer.AncientRange(kind, start, count, maxBytes)
+}
+
+// AncientBytes retrieves the value segment of the element specified by the id
+// and value offsets.
+func (f *resettableFreezer) AncientBytes(kind string, id, offset, length uint64) ([]byte, error) {
+	f.lock.RLock()
+	defer f.lock.RUnlock()
+
+	return f.freezer.AncientBytes(kind, id, offset, length)
 }
 
 // Ancients returns the length of the frozen items.
@@ -199,6 +208,13 @@ func (f *resettableFreezer) ResetTable(kind string, startAt uint64, onlyEmpty bo
 	defer f.lock.RUnlock()
 
 	return f.freezer.ResetTable(kind, startAt, onlyEmpty)
+}
+
+func (f *resettableFreezer) ResetTableForIncr(kind string, startAt uint64, onlyEmpty bool) error {
+	f.lock.RLock()
+	defer f.lock.RUnlock()
+
+	return f.freezer.ResetTableForIncr(kind, startAt, onlyEmpty)
 }
 
 // SyncAncient flushes all data tables to disk.

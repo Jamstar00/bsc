@@ -123,6 +123,10 @@ type AncientReaderOp interface {
 	//   - if maxBytes is not specified, 'count' items will be returned if they are present
 	AncientRange(kind string, start, count, maxBytes uint64) ([][]byte, error)
 
+	// AncientBytes retrieves the value segment of the element specified by the id
+	// and value offsets.
+	AncientBytes(kind string, id, offset, length uint64) ([]byte, error)
+
 	// Ancients returns the ancient item numbers in the ancient store.
 	Ancients() (uint64, error)
 
@@ -171,6 +175,8 @@ type AncientWriter interface {
 
 	// ResetTable will reset certain table with new start point
 	ResetTable(kind string, startAt uint64, onlyEmpty bool) error
+
+	ResetTableForIncr(kind string, startAt uint64, onlyEmpty bool) error
 }
 
 type FreezerEnv struct {
@@ -182,6 +188,10 @@ type FreezerEnv struct {
 type AncientFreezer interface {
 	// SetupFreezerEnv provides params.ChainConfig for checking hark forks, like isCancun.
 	SetupFreezerEnv(env *FreezerEnv, blockHistory uint64) error
+
+	// CleanBlock cleans block data in pebble and chain freezer.
+	// WARN: it's only used in the incremental snapshot situation.
+	CleanBlock(kvStore KeyValueStore, start uint64) error
 }
 
 // AncientWriteOp is given to the function argument of ModifyAncients.

@@ -24,15 +24,17 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/metrics"
+	"github.com/ethereum/go-ethereum/params"
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/parlia"
 	"github.com/ethereum/go-ethereum/core"
@@ -66,7 +68,6 @@ import (
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/dnsdisc"
 	"github.com/ethereum/go-ethereum/p2p/enode"
-	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/ethereum/go-ethereum/triedb/pathdb"
@@ -252,6 +253,22 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		chainConfig.FermiTime = config.OverrideFermi
 		overrides.OverrideFermi = config.OverrideFermi
 	}
+	if config.OverrideOsaka != nil {
+		chainConfig.OsakaTime = config.OverrideOsaka
+		overrides.OverrideOsaka = config.OverrideOsaka
+	}
+	if config.OverrideMendel != nil {
+		chainConfig.MendelTime = config.OverrideMendel
+		overrides.OverrideMendel = config.OverrideMendel
+	}
+	if config.OverrideBPO1 != nil {
+		chainConfig.BPO1Time = config.OverrideBPO1
+		overrides.OverrideBPO1 = config.OverrideBPO1
+	}
+	if config.OverrideBPO2 != nil {
+		chainConfig.BPO2Time = config.OverrideBPO2
+		overrides.OverrideBPO2 = config.OverrideBPO2
+	}
 	if config.OverrideVerkle != nil {
 		chainConfig.VerkleTime = config.OverrideVerkle
 		overrides.OverrideVerkle = config.OverrideVerkle
@@ -322,25 +339,41 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	journalFilePath := stack.ResolvePath(path) + "/" + JournalFileName
 	var (
 		options = &core.BlockChainConfig{
-			TrieCleanLimit:   config.TrieCleanCache,
-			NoPrefetch:       config.NoPrefetch,
-			TrieDirtyLimit:   config.TrieDirtyCache,
-			ArchiveMode:      config.NoPruning,
-			TrieTimeLimit:    config.TrieTimeout,
-			NoTries:          noTries,
-			SnapshotLimit:    config.SnapshotCache,
-			TriesInMemory:    config.TriesInMemory,
-			Preimages:        config.Preimages,
-			StateHistory:     config.StateHistory,
-			StateScheme:      config.StateScheme,
-			PathSyncFlush:    config.PathSyncFlush,
-			JournalFilePath:  journalFilePath,
-			JournalFile:      config.JournalFileEnabled,
-			ChainHistoryMode: config.HistoryMode,
-			TxLookupLimit:    int64(min(config.TransactionHistory, math.MaxInt64)),
+			TrieCleanLimit:        config.TrieCleanCache,
+			NoPrefetch:            config.NoPrefetch,
+			EnableBAL:             config.EnableBAL,
+			TrieDirtyLimit:        config.TrieDirtyCache,
+			ArchiveMode:           config.NoPruning,
+			TrieTimeLimit:         config.TrieTimeout,
+			NoTries:               noTries,
+			SnapshotLimit:         config.SnapshotCache,
+			TriesInMemory:         config.TriesInMemory,
+			Preimages:             config.Preimages,
+			StateHistory:          config.StateHistory,
+			StateScheme:           config.StateScheme,
+			PathSyncFlush:         config.PathSyncFlush,
+			JournalFilePath:       journalFilePath,
+			EnableIncr:            config.EnableIncrSnapshots,
+			IncrHistoryPath:       config.IncrSnapshotPath,
+			IncrHistory:           config.IncrSnapshotBlockInterval,
+			IncrStateBuffer:       config.IncrSnapshotStateBuffer,
+			IncrKeptBlocks:        config.IncrSnapshotKeptBlocks,
+			UseRemoteIncrSnapshot: config.UseRemoteIncrSnapshot,
+			RemoteIncrURL:         config.RemoteIncrSnapshotURL,
+			ChainHistoryMode:      config.HistoryMode,
+			TxLookupLimit:         int64(min(config.TransactionHistory, math.MaxInt64)),
 			VmConfig: vm.Config{
-				EnablePreimageRecording: config.EnablePreimageRecording,
+				EnablePreimageRecording:   config.EnablePreimageRecording,
+				EnableWitnessStats:        config.EnableWitnessStats,
+				StatelessSelfValidation:   config.StatelessSelfValidation,
+				EnableOpcodeOptimizations: config.EnableOpcodeOptimizing,
 			},
+			// Enables file journaling for the trie database. The journal files will be stored
+			// within the data directory. The corresponding paths will be either:
+			// - DATADIR/triedb/merkle.journal
+			// - DATADIR/triedb/verkle.journal
+			TrieJournalDirectory: stack.ResolvePath("triedb"),
+			StateSizeTracking:    config.EnableStateSizeTracking,
 		}
 	)
 	if config.DisableTxIndexer {
@@ -364,6 +397,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	if stack.Config().EnableDoubleSignMonitor {
 		bcOps = append(bcOps, core.EnableDoubleSignChecker)
 	}
+	// Override the chain config with provided settings.
 	options.Overrides = &overrides
 	eth.blockchain, err = core.NewBlockChain(chainDb, config.Genesis, eth.engine, options, bcOps...)
 	if err != nil {
@@ -371,11 +405,14 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	}
 
 	// Initialize filtermaps log index.
+	// Auto-enable checkpoint file
+	checkpointFile := filepath.Join(stack.DataDir(), "geth", "filtermap_checkpoints.json")
+
 	fmConfig := filtermaps.Config{
-		History:        config.LogHistory,
-		Disabled:       config.LogNoHistory,
-		ExportFileName: config.LogExportCheckpoints,
-		HashScheme:     config.StateScheme == rawdb.HashScheme,
+		History:            config.LogHistory,
+		Disabled:           config.LogNoHistory,
+		CheckpointFileName: checkpointFile,
+		HashScheme:         config.StateScheme == rawdb.HashScheme,
 	}
 	chainView := eth.newChainView(eth.blockchain.CurrentBlock())
 	historyCutoff, _ := eth.blockchain.HistoryPruningCutoff()
@@ -430,8 +467,10 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		RequiredBlocks:            config.RequiredBlocks,
 		DirectBroadcast:           config.DirectBroadcast,
 		EnableEVNFeatures:         stack.Config().EnableEVNFeatures,
+		EnableBAL:                 config.EnableBAL,
 		EVNNodeIdsWhitelist:       stack.Config().P2P.EVNNodeIdsWhitelist,
 		ProxyedValidatorAddresses: stack.Config().P2P.ProxyedValidatorAddresses,
+		ProxyedNodeIds:            stack.Config().P2P.ProxyedNodeIds,
 		DisablePeerTxBroadcast:    config.DisablePeerTxBroadcast,
 		PeerSet:                   newPeerSet(),
 		EnableQuickBlockFetching:  stack.Config().EnableQuickBlockFetching,
@@ -495,12 +534,24 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 
 func makeExtraData(extra []byte) []byte {
 	if len(extra) == 0 {
-		// create default extradata
+		// For version >= 1.6.4, use compact format: [version(uint32), commitID, go_version, os]
+		commitID := ""
+		git, ok := version.VCS()
+		if ok && len(git.Commit) >= 8 {
+			commitID = git.Commit[:8]
+		}
+
+		osName := runtime.GOOS
+		if len(osName) > 3 {
+			osName = osName[:3]
+		}
+
+		versionWord := uint32(gethversion.Major<<16 | gethversion.Minor<<8 | gethversion.Patch)
 		extra, _ = rlp.EncodeToBytes([]interface{}{
-			uint(gethversion.Major<<16 | gethversion.Minor<<8 | gethversion.Patch),
-			"geth",
+			versionWord,
+			commitID,
 			runtime.Version(),
-			runtime.GOOS,
+			osName,
 		})
 	}
 	if uint64(len(extra)) > params.MaximumExtraDataSize-params.ForkIDSize {

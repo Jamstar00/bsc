@@ -23,7 +23,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/trie/trienode"
 )
 
 // layerTree is a group of state layers identified by the state root.
@@ -143,7 +142,7 @@ func (tree *layerTree) len() int {
 }
 
 // add inserts a new layer into the tree if it can be linked to an existing old parent.
-func (tree *layerTree) add(root common.Hash, parentRoot common.Hash, block uint64, nodes *trienode.MergedNodeSet, states *StateSetWithOrigin) error {
+func (tree *layerTree) add(root common.Hash, parentRoot common.Hash, block uint64, nodes *nodeSetWithOrigin, states *StateSetWithOrigin) error {
 	// Reject noop updates to avoid self-loops. This is a special case that can
 	// happen for clique networks and proof-of-stake networks where empty blocks
 	// don't modify the state (0 block subsidy).
@@ -161,7 +160,7 @@ func (tree *layerTree) add(root common.Hash, parentRoot common.Hash, block uint6
 	if parent == nil {
 		return fmt.Errorf("triedb parent [%#x] layer missing", parentRoot)
 	}
-	l := parent.update(root, parent.stateID()+1, block, newNodeSet(nodes.Flatten()), states)
+	l := parent.update(root, parent.stateID()+1, block, nodes, states)
 
 	tree.lock.Lock()
 	defer tree.lock.Unlock()
@@ -386,4 +385,29 @@ func (tree *layerTree) front() common.Hash {
 		}
 		parent = children[0]
 	}
+}
+
+// bottomDiffLayer returns the bottom-most diff layer in this tree.
+// It returns the first diffLayer that is directly built on top of a diskLayer.
+func (tree *layerTree) bottomDiffLayer() *diffLayer {
+	tree.lock.RLock()
+	defer tree.lock.RUnlock()
+
+	bottomDisk := tree.bottom()
+	if bottomDisk == nil {
+		return nil
+	}
+
+	// Find diffLayer that has bottomDisk as parent
+	for _, l := range tree.layers {
+		if dl, ok := l.(*diffLayer); ok {
+			if parent := dl.parentLayer(); parent != nil {
+				if parentDisk, ok := parent.(*diskLayer); ok && parentDisk.rootHash() == bottomDisk.rootHash() {
+					return dl
+				}
+			}
+		}
+	}
+
+	return nil
 }

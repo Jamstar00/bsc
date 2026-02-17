@@ -41,8 +41,9 @@ import (
 
 // Config represents the configuration of the filter system.
 type Config struct {
-	LogCacheSize int           // maximum number of cached blocks (default: 32)
-	Timeout      time.Duration // how long filters stay active (default: 5min)
+	LogCacheSize  int           // maximum number of cached blocks (default: 32)
+	Timeout       time.Duration // how long filters stay active (default: 5min)
+	LogQueryLimit int           // maximum number of addresses allowed in filter criteria (default: 1000)
 }
 
 func (cfg Config) withDefaults() Config {
@@ -163,6 +164,8 @@ const (
 	VotesSubscription
 	// FinalizedHeadersSubscription queries hashes for finalized headers that are reached
 	FinalizedHeadersSubscription
+	// TransactionReceiptsSubscription queries for transaction receipts when transactions are included in blocks
+	TransactionReceiptsSubscription
 	// LastIndexSubscription keeps track of the last index
 	LastIndexSubscription
 )
@@ -193,8 +196,10 @@ type subscription struct {
 	txs       chan []*types.Transaction
 	headers   chan *types.Header
 	votes     chan *types.VoteEnvelope
-	installed chan struct{} // closed when the filter is installed
-	err       chan error    // closed when the filter is uninstalled
+	receipts  chan []*ReceiptWithTx
+	txHashes  map[common.Hash]bool // contains transaction hashes for transactionReceipts subscription filtering
+	installed chan struct{}        // closed when the filter is installed
+	err       chan error           // closed when the filter is uninstalled
 }
 
 // EventSystem creates subscriptions, processes events and broadcasts them to the
@@ -291,6 +296,7 @@ func (sub *Subscription) Unsubscribe() {
 			case <-sub.f.txs:
 			case <-sub.f.headers:
 			case <-sub.f.votes:
+			case <-sub.f.receipts:
 			}
 		}
 
@@ -315,8 +321,15 @@ func (es *EventSystem) SubscribeLogs(crit ethereum.FilterQuery, logs chan []*typ
 	if len(crit.Topics) > maxTopics {
 		return nil, errExceedMaxTopics
 	}
-	if len(crit.Addresses) > maxAddresses {
-		return nil, errExceedMaxAddresses
+	if es.sys.cfg.LogQueryLimit != 0 {
+		if len(crit.Addresses) > es.sys.cfg.LogQueryLimit {
+			return nil, errExceedLogQueryLimit
+		}
+		for _, topics := range crit.Topics {
+			if len(topics) > es.sys.cfg.LogQueryLimit {
+				return nil, errExceedLogQueryLimit
+			}
+		}
 	}
 	var from, to rpc.BlockNumber
 	if crit.FromBlock == nil {
@@ -370,6 +383,7 @@ func (es *EventSystem) subscribeLogs(crit ethereum.FilterQuery, logs chan []*typ
 		txs:       make(chan []*types.Transaction),
 		headers:   make(chan *types.Header),
 		votes:     make(chan *types.VoteEnvelope),
+		receipts:  make(chan []*ReceiptWithTx),
 		installed: make(chan struct{}),
 		err:       make(chan error),
 	}
@@ -387,6 +401,7 @@ func (es *EventSystem) SubscribeNewHeads(headers chan *types.Header) *Subscripti
 		txs:       make(chan []*types.Transaction),
 		headers:   headers,
 		votes:     make(chan *types.VoteEnvelope),
+		receipts:  make(chan []*ReceiptWithTx),
 		installed: make(chan struct{}),
 		err:       make(chan error),
 	}
@@ -404,6 +419,7 @@ func (es *EventSystem) SubscribeNewFinalizedHeaders(headers chan *types.Header) 
 		txs:       make(chan []*types.Transaction),
 		headers:   headers,
 		votes:     make(chan *types.VoteEnvelope),
+		receipts:  make(chan []*ReceiptWithTx),
 		installed: make(chan struct{}),
 		err:       make(chan error),
 	}
@@ -421,6 +437,7 @@ func (es *EventSystem) SubscribePendingTxs(txs chan []*types.Transaction) *Subsc
 		txs:       txs,
 		headers:   make(chan *types.Header),
 		votes:     make(chan *types.VoteEnvelope),
+		receipts:  make(chan []*ReceiptWithTx),
 		installed: make(chan struct{}),
 		err:       make(chan error),
 	}
@@ -438,6 +455,30 @@ func (es *EventSystem) SubscribeNewVotes(votes chan *types.VoteEnvelope) *Subscr
 		txs:       make(chan []*types.Transaction),
 		headers:   make(chan *types.Header),
 		votes:     votes,
+		receipts:  make(chan []*ReceiptWithTx),
+		installed: make(chan struct{}),
+		err:       make(chan error),
+	}
+	return es.subscribe(sub)
+}
+
+// SubscribeTransactionReceipts creates a subscription that writes transaction receipts for
+// transactions when they are included in blocks. If txHashes is provided, only receipts
+// for those specific transaction hashes will be delivered.
+func (es *EventSystem) SubscribeTransactionReceipts(txHashes []common.Hash, receipts chan []*ReceiptWithTx) *Subscription {
+	hashSet := make(map[common.Hash]bool)
+	for _, h := range txHashes {
+		hashSet[h] = true
+	}
+	sub := &subscription{
+		id:        rpc.NewID(),
+		typ:       TransactionReceiptsSubscription,
+		created:   time.Now(),
+		logs:      make(chan []*types.Log),
+		txs:       make(chan []*types.Transaction),
+		headers:   make(chan *types.Header),
+		receipts:  receipts,
+		txHashes:  hashSet,
 		installed: make(chan struct{}),
 		err:       make(chan error),
 	}
@@ -473,6 +514,14 @@ func (es *EventSystem) handleVoteEvent(filters filterIndex, ev core.NewVoteEvent
 func (es *EventSystem) handleChainEvent(filters filterIndex, ev core.ChainEvent) {
 	for _, f := range filters[BlocksSubscription] {
 		f.headers <- ev.Header
+	}
+
+	// Handle transaction receipts subscriptions when a new block is added
+	for _, f := range filters[TransactionReceiptsSubscription] {
+		matchedReceipts := filterReceipts(f.txHashes, ev)
+		if len(matchedReceipts) > 0 {
+			f.receipts <- matchedReceipts
+		}
 	}
 }
 

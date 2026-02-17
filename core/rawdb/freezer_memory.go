@@ -416,12 +416,16 @@ func (f *MemoryFreezer) Reset() error {
 }
 
 func (f *MemoryFreezer) TruncateTableTail(kind string, tail uint64) (uint64, error) {
-	//TODO implement me
+	// TODO implement me
 	panic("implement me")
 }
 
 func (f *MemoryFreezer) ResetTable(kind string, startAt uint64, onlyEmpty bool) error {
-	//TODO implement me
+	// TODO implement me
+	panic("not supported")
+}
+
+func (f *MemoryFreezer) ResetTableForIncr(kind string, startAt uint64, onlyEmpty bool) error {
 	panic("not supported")
 }
 
@@ -429,4 +433,29 @@ func (f *MemoryFreezer) ResetTable(kind string, startAt uint64, onlyEmpty bool) 
 // Since the memory freezer is ephemeral, an empty string is returned.
 func (f *MemoryFreezer) AncientDatadir() (string, error) {
 	return "", nil
+}
+
+// AncientBytes retrieves the value segment of the element specified by the id
+// and value offsets.
+func (f *MemoryFreezer) AncientBytes(kind string, id, offset, length uint64) ([]byte, error) {
+	f.lock.RLock()
+	defer f.lock.RUnlock()
+
+	table := f.tables[kind]
+	if table == nil {
+		return nil, errUnknownTable
+	}
+	entries, err := table.retrieve(id, 1, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return nil, errOutOfBounds
+	}
+	data := entries[0]
+
+	if offset > uint64(len(data)) || offset+length > uint64(len(data)) {
+		return nil, fmt.Errorf("requested range out of bounds: item size %d, offset %d, length %d", len(data), offset, length)
+	}
+	return data[offset : offset+length], nil
 }

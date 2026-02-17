@@ -84,6 +84,7 @@ type StateReleaseFunc func()
 type Backend interface {
 	HeaderByHash(ctx context.Context, hash common.Hash) (*types.Header, error)
 	HeaderByNumber(ctx context.Context, number rpc.BlockNumber) (*types.Header, error)
+	CurrentHeader() *types.Header
 	BlockByHash(ctx context.Context, hash common.Hash) (*types.Block, error)
 	BlockByNumber(ctx context.Context, number rpc.BlockNumber) (*types.Block, error)
 	GetCanonicalTransaction(txHash common.Hash) (bool, *types.Transaction, common.Hash, uint64, uint64)
@@ -394,8 +395,8 @@ func (api *API) traceChain(start, end *types.Block, config *TraceConfig, closed 
 			// if the relevant state is available in disk.
 			var preferDisk bool
 			if statedb != nil {
-				s1, s2, s3, s4 := statedb.Database().TrieDB().Size()
-				preferDisk = s1+s2+s3+s4 > defaultTracechainMemLimit
+				s1, s2, s3 := statedb.Database().TrieDB().Size()
+				preferDisk = s1+s2+s3 > defaultTracechainMemLimit
 			}
 			statedb, release, err = api.backend.StateAtBlock(ctx, block, reexec, statedb, false, preferDisk)
 			if err != nil {
@@ -1090,7 +1091,7 @@ func (api *API) TraceCall(ctx context.Context, args ethapi.TransactionArgs, bloc
 
 	// Apply the customization rules if required.
 	if config != nil {
-		if config.BlockOverrides != nil && config.BlockOverrides.Number.ToInt().Uint64() == h.Number.Uint64()+1 {
+		if config.BlockOverrides != nil && config.BlockOverrides.Number != nil && config.BlockOverrides.Number.ToInt().Uint64() == h.Number.Uint64()+1 {
 			// Overriding the block number to n+1 is a common way for wallets to
 			// simulate transactions, however without the following fix, a contract
 			// can assert it is being simulated by checking if blockhash(n) == 0x0 and
@@ -1116,7 +1117,7 @@ func (api *API) TraceCall(ctx context.Context, args ethapi.TransactionArgs, bloc
 		return nil, err
 	}
 	var (
-		msg         = args.ToMessage(blockContext.BaseFee, true, true)
+		msg         = args.ToMessage(blockContext.BaseFee, true)
 		tx          = args.ToTransaction(types.LegacyTxType)
 		traceConfig *TraceConfig
 	)
@@ -1246,16 +1247,60 @@ func overrideConfig(original *params.ChainConfig, override *params.ChainConfig) 
 		copy.ShanghaiTime = timestamp
 		canon = false
 	}
+	if timestamp := override.KeplerTime; timestamp != nil {
+		copy.KeplerTime = timestamp
+		canon = false
+	}
+	if timestamp := override.FeynmanTime; timestamp != nil {
+		copy.FeynmanTime = timestamp
+		canon = false
+	}
+	if timestamp := override.FeynmanFixTime; timestamp != nil {
+		copy.FeynmanFixTime = timestamp
+		canon = false
+	}
 	if timestamp := override.CancunTime; timestamp != nil {
 		copy.CancunTime = timestamp
+		canon = false
+	}
+	if timestamp := override.HaberTime; timestamp != nil {
+		copy.HaberTime = timestamp
+		canon = false
+	}
+	if timestamp := override.HaberFixTime; timestamp != nil {
+		copy.HaberFixTime = timestamp
+		canon = false
+	}
+	if timestamp := override.BohrTime; timestamp != nil {
+		copy.BohrTime = timestamp
+		canon = false
+	}
+	if timestamp := override.PascalTime; timestamp != nil {
+		copy.PascalTime = timestamp
 		canon = false
 	}
 	if timestamp := override.PragueTime; timestamp != nil {
 		copy.PragueTime = timestamp
 		canon = false
 	}
+	if timestamp := override.LorentzTime; timestamp != nil {
+		copy.LorentzTime = timestamp
+		canon = false
+	}
+	if timestamp := override.MaxwellTime; timestamp != nil {
+		copy.MaxwellTime = timestamp
+		canon = false
+	}
+	if timestamp := override.FermiTime; timestamp != nil {
+		copy.FermiTime = timestamp
+		canon = false
+	}
 	if timestamp := override.OsakaTime; timestamp != nil {
 		copy.OsakaTime = timestamp
+		canon = false
+	}
+	if timestamp := override.MendelTime; timestamp != nil {
+		copy.MendelTime = timestamp
 		canon = false
 	}
 	if timestamp := override.VerkleTime; timestamp != nil {

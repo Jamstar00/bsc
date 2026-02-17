@@ -129,6 +129,12 @@ type Peer struct {
 	// it indicates the peer is in the validator network, it will directly broadcast when miner/sentry broadcast mined block,
 	// and won't broadcast any txs between EVN peers.
 	EVNPeerFlag atomic.Bool
+
+	// Indicates whether this peer is proxyed.
+	ProxyedPeerFlag atomic.Bool
+
+	// it indicates the peer can handle BAL(block access list) packet
+	CanHandleBAL atomic.Bool
 }
 
 // NewPeer returns a peer for testing purposes.
@@ -194,7 +200,6 @@ func (p *Peer) Fullname() string {
 
 // Caps returns the capabilities (supported subprotocols) of the remote peer.
 func (p *Peer) Caps() []Cap {
-	// TODO: maybe return copy
 	return p.rw.caps
 }
 
@@ -203,10 +208,8 @@ func (p *Peer) Caps() []Cap {
 // versions is supported by both this node and the peer p.
 func (p *Peer) RunningCap(protocol string, versions []uint) bool {
 	if proto, ok := p.running[protocol]; ok {
-		for _, ver := range versions {
-			if proto.Version == ver {
-				return true
-			}
+		if slices.Contains(versions, proto.Version) {
+			return true
 		}
 	}
 	return false
@@ -645,7 +648,7 @@ func (p *Peer) Info() *PeerInfo {
 	info.Network.RemoteAddress = p.RemoteAddr().String()
 	info.Network.Inbound = p.rw.is(inboundConn)
 	// After Maxwell, we treat all EVN peers as trusted
-	info.Network.Trusted = p.rw.is(trustedConn) || p.EVNPeerFlag.Load()
+	info.Network.Trusted = p.rw.is(trustedConn) || p.EVNPeerFlag.Load() || p.ProxyedPeerFlag.Load()
 	info.Network.Static = p.rw.is(staticDialedConn)
 
 	// Gather all the running protocol infos

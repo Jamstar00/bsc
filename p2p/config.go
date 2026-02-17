@@ -36,8 +36,7 @@ type Config struct {
 	// This field must be set to a valid secp256k1 private key.
 	PrivateKey *ecdsa.PrivateKey `toml:"-"`
 
-	// MaxPeers is the maximum number of peers that can be
-	// connected. It must be greater than zero.
+	// MaxPeers is the maximum number of peers that can be connected.
 	MaxPeers int
 
 	// MaxPeersPerIP is the maximum number of peers that can be
@@ -97,6 +96,10 @@ type Config struct {
 	// ProxyedValidatorAddresses is a list of validator addresses that the local node proxies,
 	// it usually used for sentry nodes
 	ProxyedValidatorAddresses []common.Address `toml:",omitempty"`
+
+	// ProxyedNodeIds lists node IDs that receive direct broadcasts of blocks and votes,
+	// excluding transactions, to prevent delays in block and vote propagation.
+	ProxyedNodeIds []enode.ID `toml:",omitempty"`
 
 	// Connectivity can be restricted to certain IP networks.
 	// If this option is set to a non-nil value, only hosts which match one of the

@@ -27,6 +27,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/cmd/utils"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/state/pruner"
@@ -163,6 +164,15 @@ The export-preimages command exports hash preimages to a flat file, in exactly
 the expected order for the overlay tree migration.
 `,
 			},
+			{
+				Action:    mergeIncrSnapshot,
+				Name:      "merge-incr-snapshot",
+				Usage:     "Merge the incremental snapshot into local data",
+				ArgsUsage: "",
+				Flags: slices.Concat([]cli.Flag{utils.IncrSnapshotPathFlag},
+					utils.DatabaseFlags),
+				Description: `This command merges multiple incremental snapshots into local data`,
+			},
 		},
 	}
 )
@@ -220,7 +230,7 @@ func verifyState(ctx *cli.Context) error {
 		log.Error("Failed to load head block")
 		return errors.New("no head block")
 	}
-	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false)
+	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false, false)
 	defer triedb.Close()
 
 	var (
@@ -285,7 +295,7 @@ func traverseState(ctx *cli.Context) error {
 	chaindb := utils.MakeChainDatabase(ctx, stack, true)
 	defer chaindb.Close()
 
-	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false)
+	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false, false)
 	defer triedb.Close()
 
 	headBlock := rawdb.ReadHeadBlock(chaindb)
@@ -394,7 +404,7 @@ func traverseRawState(ctx *cli.Context) error {
 	chaindb := utils.MakeChainDatabase(ctx, stack, true)
 	defer chaindb.Close()
 
-	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false)
+	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false, false)
 	defer triedb.Close()
 
 	headBlock := rawdb.ReadHeadBlock(chaindb)
@@ -561,22 +571,14 @@ func dumpState(ctx *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	defer db.Close()
-	triedb := utils.MakeTrieDatabase(ctx, stack, db, false, true, false)
+	triedb := utils.MakeTrieDatabase(ctx, stack, db, false, true, false, false)
 	defer triedb.Close()
 
-	snapConfig := snapshot.Config{
-		CacheSize:  256,
-		Recovery:   false,
-		NoBuild:    true,
-		AsyncBuild: false,
-	}
-	triesInMemory := ctx.Uint64(utils.TriesInMemoryFlag.Name)
-	snaptree, err := snapshot.New(snapConfig, db, triedb, root, int(triesInMemory), false)
+	stateIt, err := utils.NewStateIterator(triedb, db, root, int(ctx.Uint64(utils.TriesInMemoryFlag.Name)))
 	if err != nil {
 		return err
 	}
-	accIt, err := snaptree.AccountIterator(root, common.BytesToHash(conf.Start))
+	accIt, err := stateIt.AccountIterator(root, common.BytesToHash(conf.Start))
 	if err != nil {
 		return err
 	}
@@ -610,7 +612,7 @@ func dumpState(ctx *cli.Context) error {
 		if !conf.SkipStorage {
 			da.Storage = make(map[common.Hash]string)
 
-			stIt, err := snaptree.StorageIterator(root, accIt.Hash(), common.Hash{})
+			stIt, err := stateIt.StorageIterator(root, accIt.Hash(), common.Hash{})
 			if err != nil {
 				return err
 			}
@@ -645,7 +647,7 @@ func snapshotExportPreimages(ctx *cli.Context) error {
 	chaindb := utils.MakeChainDatabase(ctx, stack, true)
 	defer chaindb.Close()
 
-	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false)
+	triedb := utils.MakeTrieDatabase(ctx, stack, chaindb, false, true, false, false)
 	defer triedb.Close()
 
 	var root common.Hash
@@ -663,17 +665,11 @@ func snapshotExportPreimages(ctx *cli.Context) error {
 		}
 		root = headBlock.Root()
 	}
-	snapConfig := snapshot.Config{
-		CacheSize:  256,
-		Recovery:   false,
-		NoBuild:    true,
-		AsyncBuild: false,
-	}
-	snaptree, err := snapshot.New(snapConfig, chaindb, triedb, root, 128, false)
+	stateIt, err := utils.NewStateIterator(triedb, chaindb, root, int(ctx.Uint64(utils.TriesInMemoryFlag.Name)))
 	if err != nil {
 		return err
 	}
-	return utils.ExportSnapshotPreimages(chaindb, snaptree, ctx.Args().First(), root)
+	return utils.ExportSnapshotPreimages(chaindb, stateIt, ctx.Args().First(), root)
 }
 
 // checkAccount iterates the snap data layers, and looks up the given account
@@ -705,5 +701,72 @@ func checkAccount(ctx *cli.Context) error {
 		return err
 	}
 	log.Info("Checked the snapshot journalled storage", "time", common.PrettyDuration(time.Since(start)))
+	return nil
+}
+
+// mergeIncrSnapshot merges the incremental snapshot into local data.
+func mergeIncrSnapshot(ctx *cli.Context) error {
+	stack, _ := makeConfigNode(ctx)
+	defer stack.Close()
+
+	chainDB := utils.MakeChainDatabase(ctx, stack, false)
+	defer chainDB.Close()
+
+	trieDB := utils.MakeTrieDatabase(ctx, stack, chainDB, false, false, false, true)
+	defer trieDB.Close()
+
+	if !ctx.IsSet(utils.IncrSnapshotPathFlag.Name) {
+		return errors.New("incremental snapshot path is not set")
+	}
+	path := ctx.String(utils.IncrSnapshotPathFlag.Name)
+
+	startBlock, err := trieDB.GetStartBlock()
+	if err != nil {
+		log.Error("Failed to get start block", "error", err)
+		return err
+	}
+	dirs, err := rawdb.GetAllIncrDirs(path)
+	if err != nil {
+		log.Error("Failed to get all incremental directories", "err", err)
+		return err
+	}
+	if startBlock < dirs[0].StartBlockNum {
+		return fmt.Errorf("local start block %d is lower than incr first start block %d", startBlock, dirs[0].StartBlockNum)
+	}
+
+	for i := 1; i < len(dirs); i++ {
+		prevFile := dirs[i-1]
+		currFile := dirs[i]
+
+		expectedStartBlock := prevFile.EndBlockNum + 1
+		if currFile.StartBlockNum != expectedStartBlock {
+			return fmt.Errorf("file continuity broken: file %s ends at %d, but file %s starts at %d (expected %d)",
+				prevFile.Name, prevFile.EndBlockNum, currFile.Name, currFile.StartBlockNum, expectedStartBlock)
+		}
+	}
+
+	log.Info("Start merging incremental snapshot", "path", path, "incremental snapshot number", len(dirs))
+	for i, dir := range dirs {
+		if i == len(dirs)-1 {
+			complete, err := rawdb.CheckIncrSnapshotComplete(dir.Path)
+			if err != nil {
+				log.Error("Failed to check last incr snapshot complete", "err", err)
+				return err
+			}
+			if !complete {
+				log.Warn("Skip last incr snapshot due to data is incomplete")
+				continue
+			}
+		}
+
+		if dir.StartBlockNum >= startBlock && dir.EndBlockNum > startBlock {
+			if err = core.MergeIncrSnapshot(chainDB, trieDB, dir.Path); err != nil {
+				log.Error("Failed to merge incremental snapshot", "err", err)
+				return err
+			}
+		} else {
+			log.Info("Skip merge incremental snapshot", "dir", dir.Name)
+		}
+	}
 	return nil
 }

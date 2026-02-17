@@ -19,6 +19,7 @@ package pathdb
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/log"
 )
 
@@ -319,8 +321,71 @@ func (dl *diskLayer) storage(accountHash, storageHash common.Hash, depth int) ([
 
 // update implements the layer interface, returning a new diff layer on top
 // with the given state set.
-func (dl *diskLayer) update(root common.Hash, id uint64, block uint64, nodes *nodeSet, states *StateSetWithOrigin) *diffLayer {
+func (dl *diskLayer) update(root common.Hash, id uint64, block uint64, nodes *nodeSetWithOrigin, states *StateSetWithOrigin) *diffLayer {
 	return newDiffLayer(dl, root, id, block, nodes, states)
+}
+
+// writeStateHistory stores the state history and indexes if indexing is
+// permitted.
+//
+// What's more, this function also returns a flag indicating whether the
+// buffer flushing is required, ensuring the persistent state ID is always
+// greater than or equal to the first history ID.
+func (dl *diskLayer) writeStateHistory(diff *diffLayer) (bool, error) {
+	// Short circuit if state history is not permitted
+	if dl.db.stateFreezer == nil {
+		return false, nil
+	}
+	// Bail out with an error if writing the state history fails.
+	// This can happen, for example, if the device is full.
+	err := writeStateHistory(dl.db.stateFreezer, diff)
+	if err != nil {
+		return false, err
+	}
+	// Notify the state history indexer for newly created history
+	if dl.db.stateIndexer != nil {
+		if err := dl.db.stateIndexer.extend(diff.stateID()); err != nil {
+			return false, err
+		}
+	}
+	// Determine if the persisted history object has exceeded the
+	// configured limitation.
+	limit := dl.db.config.StateHistory
+	if limit == 0 {
+		return false, nil
+	}
+	tail, err := dl.db.stateFreezer.Tail()
+	if err != nil {
+		return false, err
+	} // firstID = tail+1
+
+	// length = diff.stateID()-firstID+1 = diff.stateID()-tail
+	if diff.stateID()-tail <= limit {
+		return false, nil
+	}
+	newFirst := diff.stateID() - limit + 1 // the id of first history **after truncation**
+
+	// In a rare case where the ID of the first history object (after tail
+	// truncation) exceeds the persisted state ID, we must take corrective
+	// steps:
+	//
+	// - Skip tail truncation temporarily, avoid the scenario that associated
+	//   history of persistent state is removed
+	//
+	// - Force a commit of the cached dirty states into persistent state
+	//
+	// These measures ensure the persisted state ID always remains greater
+	// than or equal to the first history ID.
+	if persistentID := rawdb.ReadPersistentStateID(dl.db.diskdb); persistentID < newFirst {
+		log.Debug("Skip tail truncation", "persistentID", persistentID, "tailID", tail+1, "headID", diff.stateID(), "limit", limit)
+		return true, nil
+	}
+	pruned, err := truncateFromTail(dl.db.stateFreezer, typeStateHistory, newFirst-1)
+	if err != nil {
+		return false, err
+	}
+	log.Debug("Pruned state history", "items", pruned, "tailid", newFirst)
+	return false, nil
 }
 
 // commit merges the given bottom-most diff layer into the node buffer
@@ -333,35 +398,19 @@ func (dl *diskLayer) commit(bottom *diffLayer, force bool) (*diskLayer, error) {
 	// Construct and store the state history first. If crash happens after storing
 	// the state history but without flushing the corresponding states(journal),
 	// the stored state history will be truncated from head in the next restart.
-	var (
-		overflow bool
-		oldest   uint64
-	)
-	if dl.db.freezer != nil {
-		// Bail out with an error if writing the state history fails.
-		// This can happen, for example, if the device is full.
-		err := writeHistory(dl.db.freezer, bottom)
+	flush, err := dl.writeStateHistory(bottom)
+	if err != nil {
+		return nil, err
+	}
+
+	if dl.db.config.EnableIncr {
+		err := dl.commitIncrData(bottom)
 		if err != nil {
+			log.Error("Failed to commit incremental data after retries", "err", err)
 			return nil, err
-		}
-		// Determine if the persisted history object has exceeded the configured
-		// limitation, set the overflow as true if so.
-		tail, err := dl.db.freezer.Tail()
-		if err != nil {
-			return nil, err
-		}
-		limit := dl.db.config.StateHistory
-		if limit != 0 && bottom.stateID()-tail > limit {
-			overflow = true
-			oldest = bottom.stateID() - limit + 1 // track the id of history **after truncation**
-		}
-		// Notify the state history indexer for newly created history
-		if dl.db.indexer != nil {
-			if err := dl.db.indexer.extend(bottom.stateID()); err != nil {
-				return nil, err
-			}
 		}
 	}
+
 	// Mark the diskLayer as stale before applying any mutations on top.
 	dl.stale = true
 
@@ -373,21 +422,13 @@ func (dl *diskLayer) commit(bottom *diffLayer, force bool) (*diskLayer, error) {
 	}
 	rawdb.WriteStateID(dl.db.diskdb, bottom.rootHash(), bottom.stateID())
 
-	// In a unique scenario where the ID of the oldest history object (after tail
-	// truncation) surpasses the persisted state ID, we take the necessary action
-	// of forcibly committing the cached dirty states to ensure that the persisted
-	// state ID remains higher.
-	persistedID := rawdb.ReadPersistentStateID(dl.db.diskdb)
-	if !force && persistedID < oldest {
-		force = true
-	}
 	// Merge the trie nodes and flat states of the bottom-most diff layer into the
 	// buffer as the combined layer.
-	combined := dl.buffer.commit(bottom.nodes, bottom.states.stateSet)
+	combined := dl.buffer.commit(bottom.nodes.nodeSet, bottom.states.stateSet)
 
 	// Terminate the background state snapshot generation before mutating the
 	// persistent state.
-	if combined.full() || force {
+	if combined.full() || force || flush {
 		// Wait until the previous frozen buffer is fully flushed
 		if dl.frozen != nil {
 			if err := dl.frozen.waitFlush(); err != nil {
@@ -418,7 +459,7 @@ func (dl *diskLayer) commit(bottom *diffLayer, force bool) (*diskLayer, error) {
 
 		// Freeze the live buffer and schedule background flushing
 		dl.frozen = combined
-		dl.frozen.flush(bottom.root, dl.db.diskdb, dl.db.freezer, progress, dl.nodes, dl.states, bottom.stateID(), func() {
+		dl.frozen.flush(bottom.root, dl.db.diskdb, dl.db.stateFreezer, progress, dl.nodes, dl.states, bottom.stateID(), func() {
 			// Resume the background generation if it's not completed yet.
 			// The generator is assumed to be available if the progress is
 			// not nil.
@@ -431,8 +472,8 @@ func (dl *diskLayer) commit(bottom *diffLayer, force bool) (*diskLayer, error) {
 			}
 		})
 		// Block until the frozen buffer is fully flushed out if the async flushing
-		// is not allowed, or if the oldest history surpasses the persisted state ID.
-		if dl.db.config.NoAsyncFlush || persistedID < oldest {
+		// is not allowed.
+		if dl.db.config.NoAsyncFlush {
 			if err := dl.frozen.waitFlush(); err != nil {
 				return nil, err
 			}
@@ -445,20 +486,11 @@ func (dl *diskLayer) commit(bottom *diffLayer, force bool) (*diskLayer, error) {
 	if dl.generator != nil {
 		ndl.setGenerator(dl.generator)
 	}
-	// To remove outdated history objects from the end, we set the 'tail' parameter
-	// to 'oldest-1' due to the offset between the freezer index and the history ID.
-	if overflow {
-		pruned, err := truncateFromTail(ndl.db.diskdb, ndl.db.freezer, oldest-1)
-		if err != nil {
-			return nil, err
-		}
-		log.Debug("Pruned state history", "items", pruned, "tailid", oldest)
-	}
 	return ndl, nil
 }
 
 // revert applies the given state history and return a reverted disk layer.
-func (dl *diskLayer) revert(h *history) (*diskLayer, error) {
+func (dl *diskLayer) revert(h *stateHistory) (*diskLayer, error) {
 	start := time.Now()
 	if h.meta.root != dl.rootHash() {
 		return nil, errUnexpectedHistory
@@ -484,8 +516,8 @@ func (dl *diskLayer) revert(h *history) (*diskLayer, error) {
 	dl.stale = true
 
 	// Unindex the corresponding state history
-	if dl.db.indexer != nil {
-		if err := dl.db.indexer.shorten(dl.id); err != nil {
+	if dl.db.stateIndexer != nil {
+		if err := dl.db.stateIndexer.shorten(dl.id); err != nil {
 			return nil, err
 		}
 	}
@@ -548,15 +580,14 @@ func (dl *diskLayer) revert(h *history) (*diskLayer, error) {
 }
 
 // size returns the approximate size of cached nodes in the disk layer.
-func (dl *diskLayer) size() (common.StorageSize, common.StorageSize) {
+func (dl *diskLayer) size() common.StorageSize {
 	dl.lock.RLock()
 	defer dl.lock.RUnlock()
 
 	if dl.stale {
-		return 0, 0
+		return 0
 	}
-	dirtyNodes, dirtyimmutableNodes := dl.buffer.size(), 0
-	return common.StorageSize(dirtyNodes), common.StorageSize(dirtyimmutableNodes)
+	return common.StorageSize(dl.buffer.size())
 }
 
 // resetCache releases the memory held by clean cache to prevent memory leak.
@@ -620,5 +651,98 @@ func (dl *diskLayer) terminate() error {
 	if dl.generator != nil {
 		dl.generator.stop()
 	}
+	return nil
+}
+
+// commitIncrData attempts to commit incremental data with retry mechanism.
+func (dl *diskLayer) commitIncrData(bottom *diffLayer) error {
+	const (
+		maxRetries = 5
+		baseDelay  = 100 * time.Millisecond
+		maxDelay   = 5 * time.Second
+	)
+
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		err := dl.db.incr.commit(bottom)
+		if err == nil {
+			if attempt > 0 {
+				log.Info("Incremental data commit succeeded after retries",
+					"block", bottom.block, "stateID", bottom.stateID(), "attempts", attempt+1)
+			}
+			return nil
+		}
+		lastErr = err
+
+		// Check if this is a queue full error
+		if strings.Contains(err.Error(), "task queue is full") {
+			// Calculate delay with exponential backoff
+			delay := baseDelay * time.Duration(1<<uint(attempt))
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+
+			// Check if directory switch is in progress
+			switching := dl.db.incr.incrDB.IsSwitching()
+			queueUsage := dl.db.incr.GetQueueUsageRate()
+			log.Warn("Task queue is full, retrying after delay", "block", bottom.block,
+				"stateID", bottom.stateID(), "attempt", attempt+1, "maxRetries", maxRetries, "delay", delay,
+				"switching", switching, "queueUsage", fmt.Sprintf("%.1f%%", queueUsage))
+
+			// If the directory switch is in progress, use longer delay
+			if switching {
+				delay = maxDelay
+				log.Info("Directory switch detected, using longer delay", "delay", delay)
+			}
+			time.Sleep(delay)
+			continue
+		}
+
+		log.Error("Non-recoverable error committing incremental data",
+			"block", bottom.block, "stateID", bottom.stateID(), "err", err)
+		incrCommitErrorMeter.Mark(1)
+		return err
+	}
+
+	incrCommitErrorMeter.Mark(1)
+	log.Error("Failed to commit incremental data after all retries",
+		"block", bottom.block, "stateID", bottom.stateID(), "maxRetries", maxRetries, "finalError", lastErr)
+	dl.db.incr.LogStats()
+	return fmt.Errorf("failed to commit incremental data after %d retries: %w", maxRetries, lastErr)
+}
+
+// mergeIncrNodesWithStates merges incr trie nodes and states into local data.
+func (dl *diskLayer) mergeIncrNodesWithStates(db ethdb.KeyValueStore, freezer ethdb.AncientWriter,
+	incrFreezer ethdb.ResettableAncientStore, start, end uint64) error {
+	persistID := rawdb.ReadPersistentStateID(db)
+	log.Info("Ancient db meta info", "persistent_state_id", persistID, "start", start, "end", end)
+
+	for i := start; i <= end; i++ {
+		m := rawdb.ReadIncrStateHistoryMeta(incrFreezer, i)
+		if m == nil {
+			return fmt.Errorf("not found incr state history meta: %d", i)
+		}
+		var combined *buffer
+		if !m.HasStates {
+			nodes, err := readIncrTrieNodes(incrFreezer, i)
+			if err != nil {
+				return err
+			}
+			combined = dl.buffer.commit(nodes, newStates(nil, nil, false))
+		} else {
+			states, err := readIncrStatesData(incrFreezer, i)
+			if err != nil {
+				return err
+			}
+			combined = dl.buffer.commit(newNodeSet(nil), states)
+		}
+
+		if err := combined.flushIncrSnapshot(m.Root, db, freezer, nil, m.StateIDArray[1]); err != nil {
+			return err
+		}
+		log.Info("Flush incr nodes and states", "layers", m.Layers, "root", m.Root, "hasStates", m.HasStates)
+	}
+
+	log.Info("Finished merging incremental state history")
 	return nil
 }

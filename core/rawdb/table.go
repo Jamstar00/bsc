@@ -62,6 +62,12 @@ func (t *table) AncientRange(kind string, start, count, maxBytes uint64) ([][]by
 	return t.db.AncientRange(kind, start, count, maxBytes)
 }
 
+// AncientBytes is a noop passthrough that just forwards the request to the underlying
+// database.
+func (t *table) AncientBytes(kind string, id, offset, length uint64) ([]byte, error) {
+	return t.db.AncientBytes(kind, id, offset, length)
+}
+
 // Ancients is a noop passthrough that just forwards the request to the underlying
 // database.
 func (t *table) Ancients() (uint64, error) {
@@ -93,6 +99,10 @@ func (t *table) TruncateTableTail(kind string, tail uint64) (uint64, error) {
 // ResetTable will reset certain table with new start point
 func (t *table) ResetTable(kind string, startAt uint64, onlyEmpty bool) error {
 	return t.db.ResetTable(kind, startAt, onlyEmpty)
+}
+
+func (t *table) ResetTableForIncr(kind string, startAt uint64, onlyEmpty bool) error {
+	return t.db.ResetTableForIncr(kind, startAt, onlyEmpty)
 }
 
 func (t *table) ReadAncients(fn func(reader ethdb.AncientReaderOp) error) (err error) {
@@ -232,6 +242,10 @@ func (t *table) NewBatchWithSize(size int) ethdb.Batch {
 }
 
 func (t *table) SetupFreezerEnv(env *ethdb.FreezerEnv, blockHistory uint64) error {
+	return nil
+}
+
+func (t *table) CleanBlock(kvStore ethdb.KeyValueStore, start uint64) error {
 	return nil
 }
 
